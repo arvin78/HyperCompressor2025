@@ -27,15 +27,11 @@ jobs:
         run: |
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
-      - name: Unzip project
+      - name: Unzip project (newest zip)
         shell: bash
         run: |
           set -e
-          ZIPFILE="$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)"
-          if [ -z "$ZIPFILE" ]; then
-            echo "No zip found in repo root. Upload your project zip first."
-            exit 1
-          fi
+          ZIPFILE="$(ls -t *.zip | head -n 1)"
           echo "Using ZIP: $ZIPFILE"
           mkdir -p project
           unzip -o "$ZIPFILE" -d project
@@ -44,7 +40,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          ROOT_FILE="$(find project -maxdepth 4 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
+          ROOT_FILE="$(find project -maxdepth 5 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
           if [ -z "$ROOT_FILE" ]; then
             echo "Could not find settings.gradle(.kts) inside the zip."
             exit 1
@@ -62,7 +58,7 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
