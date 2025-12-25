@@ -9,34 +9,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install unzip
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip
-
-      - name: Detect ZIP and unzip
-        run: |
-          ls -la
-          ZIP_FILE="$(ls -1 *.zip | head -n 1)"
-          echo "Using ZIP: $ZIP_FILE"
-          unzip -o "$ZIP_FILE"
-          echo "After unzip:"
-          ls -la
-
-      - name: Find project root
-        id: findroot
-        run: |
-          ROOT_FILE=$(find . -maxdepth 5 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
-          echo "ROOT_FILE=$ROOT_FILE"
-          if [ -z "$ROOT_FILE" ]; then
-            echo "Project root not found!"
-            exit 1
-          fi
-          ROOT_DIR=$(dirname "$ROOT_FILE")
-          echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_ENV
+        run: sudo apt-get update && sudo apt-get install -y unzip
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -49,33 +25,46 @@ jobs:
 
       - name: Install Android SDK packages
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.6"
+      - name: Unzip project
+        shell: bash
+        run: |
+          set -e
+          ZIPFILE="$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)"
+          if [ -z "$ZIPFILE" ]; then
+            echo "No zip found in repo root. Upload your project zip first."
+            exit 1
+          fi
+          echo "Using ZIP: $ZIPFILE"
+          mkdir -p project
+          unzip -o "$ZIPFILE" -d project
+
+      - name: Find project root
+        shell: bash
+        run: |
+          set -e
+          ROOT_FILE="$(find project -maxdepth 4 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
+          if [ -z "$ROOT_FILE" ]; then
+            echo "Could not find settings.gradle(.kts) inside the zip."
+            exit 1
+          fi
+          ROOT_DIR="$(dirname "$ROOT_FILE")"
+          echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_ENV
+          echo "Detected project root: $ROOT_DIR"
 
       - name: Build Debug APK
+        shell: bash
         run: |
+          set -e
           cd "$ROOT_DIR"
           gradle wrapper --gradle-version 8.6
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug
 
-      - name: Collect APK
-        run: |
-          mkdir -p out
-          APK_PATH=$(find "$ROOT_DIR/app/build/outputs/apk/debug" -name "*.apk" | head -n 1)
-          echo "APK_PATH=$APK_PATH"
-          if [ -z "$APK_PATH" ]; then
-            echo "APK not found!"
-            exit 1
-          fi
-          cp "$APK_PATH" out/app-debug.apk
-
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
-          path: out/app-debug.apk 
+          path: |
+            ${{ env.ROOT_DIR }}/app/build/outputs/apk/debug/*.apk
