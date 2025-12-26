@@ -48,12 +48,22 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install SDK packages
+      - name: Install SDK packages + accept licenses (no broken-pipe fail)
         shell: bash
         run: |
           set -e
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-          yes | sdkmanager --licenses >/dev/null
+
+          # Accept licenses but do NOT fail on "yes: Broken pipe".
+          set +e
+          yes | sdkmanager --licenses > /dev/null 2>&1
+          SDK_STATUS=${PIPESTATUS[1]}
+          set -e
+
+          if [ "$SDK_STATUS" -ne 0 ]; then
+            echo "sdkmanager --licenses failed with exit code $SDK_STATUS"
+            exit "$SDK_STATUS"
+          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
