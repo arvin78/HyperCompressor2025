@@ -1,4 +1,4 @@
-name: Build APK from ZIP (No-YAML-Traps)
+name: Build APK from ZIP (Ultimate Fix)
 
 on:
   workflow_dispatch:
@@ -28,16 +28,16 @@ jobs:
         with:
           gradle-version: "8.6"
 
-      - name: Install tools
+      - name: Install unzip
         run: sudo apt-get update && sudo apt-get install -y unzip
 
-      - name: Unzip project (auto)
+      - name: Unzip ZIP (auto)
         shell: bash
         run: |
           set -euo pipefail
           ZIPFILE="$(ls -t *.zip 2>/dev/null | head -n 1 || true)"
           if [ -z "$ZIPFILE" ]; then
-            echo "ERROR: No .zip file found in repo root."
+            echo "ERROR: No .zip in repo root."
             ls -la
             exit 1
           fi
@@ -60,11 +60,10 @@ jobs:
           echo "ROOT_DIR=$ROOT_DIR" >> "$GITHUB_ENV"
           echo "Project root: $ROOT_DIR"
 
-      - name: Auto-fix common breakers (no heredoc)
+      - name: Auto-fix missing styles (ShapeAppearanceOverlay)
         shell: bash
         run: |
           set -euo pipefail
-          echo "ROOT_DIR=$ROOT_DIR"
 
           # gradlew perms + CRLF
           if [ -f "$ROOT_DIR/gradlew" ]; then
@@ -72,13 +71,22 @@ jobs:
             chmod +x "$ROOT_DIR/gradlew" || true
           fi
 
-          # Accept licenses (safe)
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-          # Missing Material shape overlay styles (ONLY if missing; avoids duplicate resources)
           VALUES_DIR="$ROOT_DIR/app/src/main/res/values"
           mkdir -p "$VALUES_DIR"
 
+          # Base style: ShapeAppearanceOverlay (THIS was missing and caused your AAPT crash)
+          if ! grep -R --include='*.xml' -n 'name="ShapeAppearanceOverlay"' "$VALUES_DIR" >/dev/null 2>&1; then
+            printf '%s\n' \
+              '<resources>' \
+              '  <style name="ShapeAppearanceOverlay">' \
+              '    <item name="cornerFamily">rounded</item>' \
+              '    <item name="cornerSize">16dp</item>' \
+              '  </style>' \
+              '</resources>' \
+              > "$VALUES_DIR/hyper_hotfix_shape_base.xml"
+          fi
+
+          # Keep these too (safe)
           if ! grep -R --include='*.xml' -n 'name="ShapeAppearanceOverlay\.App"' "$VALUES_DIR" >/dev/null 2>&1; then
             printf '%s\n' \
               '<resources>' \
@@ -106,13 +114,10 @@ jobs:
         run: |
           set -euo pipefail
           cd "$ROOT_DIR"
-
-          # Ensure wrapper exists
           if [ ! -f "./gradlew" ]; then
             gradle wrapper --gradle-version 8.6
             chmod +x ./gradlew
           fi
-
           ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
