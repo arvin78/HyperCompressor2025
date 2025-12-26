@@ -1,4 +1,4 @@
-name: Build APK from ZIP (Auto-Fix Resources + Media3)
+name: Build Debug APK (from ZIP)
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,30 +22,88 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ZIPFILE="$(ls -t *.zip 2>/dev/null | head -n 1 || true)"
-          if [ -z "$ZIPFILE" ]; then
-            echo "ERROR: No .zip file found in repo root."
+
+          # Prefer your PRO zip if it exists
+          if [ -f "HyperCompressor_2025_PRO.zip" ]; then
+            ZIPFILE="HyperCompressor_2025_PRO.zip"
+          else
+            ZIPFILE="$(ls -1 *.zip 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -z "${ZIPFILE}" ]; then
+            echo "ERROR: No ZIP found in repo root."
             ls -la
             exit 1
           fi
-          echo "Using ZIP: $ZIPFILE"
+
+          echo "Using ZIP: ${ZIPFILE}"
           rm -rf project
           mkdir -p project
-          unzip -o "$ZIPFILE" -d project
+          unzip -o "${ZIPFILE}" -d project
 
       - name: Find Gradle project root
         shell: bash
         run: |
           set -euo pipefail
-          ROOT_FILE="$(find project -maxdepth 10 -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit || true)"
-          if [ -z "$ROOT_FILE" ]; then
+          ROOT_FILE="$(find project -maxdepth 12 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
+          if [ -z "${ROOT_FILE}" ]; then
             echo "ERROR: settings.gradle(.kts) not found inside zip."
-            find project -maxdepth 4 -type f | head -n 200 || true
+            find project -maxdepth 5 -type f | head -n 200 || true
             exit 1
           fi
-          ROOT_DIR="$(dirname "$ROOT_FILE")"
-          echo "ROOT_DIR=$ROOT_DIR" >> "$GITHUB_ENV"
-          echo "Project root: $ROOT_DIR"
+          ROOT_DIR="$(dirname "${ROOT_FILE}")"
+          echo "ROOT_DIR=${ROOT_DIR}" >> "${GITHUB_ENV}"
+          echo "Project root: ${ROOT_DIR}"
+
+      - name: Hotfix resources (ShapeAppearanceOverlay) if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          VALUES_DIR="${ROOT_DIR}/app/src/main/res/values"
+          mkdir -p "${VALUES_DIR}"
+
+          # If style missing, create it
+          if ! grep -R --include='*.xml' -n 'name="ShapeAppearanceOverlay.App"' "${VALUES_DIR}" >/dev/null 2>&1; then
+            cat > "${VALUES_DIR}/hyper_hotfix.xml" <<'XML'
+<resources>
+  <style name="ShapeAppearanceOverlay.App">
+    <item name="cornerFamily">rounded</item>
+    <item name="cornerSize">16dp</item>
+  </style>
+
+  <style name="ShapeAppearanceOverlay.App.Round16">
+    <item name="cornerFamily">rounded</item>
+    <item name="cornerSize">16dp</item>
+  </style>
+</resources>
+XML
+          fi
+
+      - name: Patch crash on real phones (WorkManager ForegroundService type)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKER="$(find "${ROOT_DIR}" -type f -name 'CompressWorker.kt' -print -quit || true)"
+          if [ -z "${WORKER}" ]; then
+            echo "ERROR: CompressWorker.kt not found"
+            exit 1
+          fi
+
+          # IMPORTANT:
+          # WorkManager's internal foreground service commonly declares dataSync.
+          # mediaProcessing can crash on Android 13- and can mismatch on Android 14+.
+          sed -i 's/FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING/FOREGROUND_SERVICE_TYPE_DATA_SYNC/g' "${WORKER}"
+
+          MANIFEST="$(find "${ROOT_DIR}/app/src/main" -maxdepth 1 -type f -name 'AndroidManifest.xml' -print -quit || true)"
+          if [ -n "${MANIFEST}" ]; then
+            # Add permission for Android 14+ (safe no-op on older)
+            if ! grep -q 'FOREGROUND_SERVICE_DATA_SYNC' "${MANIFEST}"; then
+              perl -0777 -i -pe 's#(<uses-permission[^>]*android:name="android\.permission\.FOREGROUND_SERVICE"[^>]*/>\s*)#$1  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n#s' "${MANIFEST}" || true
+            fi
+          fi
+
+          echo "Patched: ForegroundServiceType -> DATA_SYNC"
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -55,95 +114,23 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Setup Gradle 8.6
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.6"
-
       - name: Install SDK packages
         run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Patch project (fix missing styles + BuildConfig + Media3 API)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # gradlew perms + CRLF
-          if [ -f "$ROOT_DIR/gradlew" ]; then
-            sed -i 's/\r$//' "$ROOT_DIR/gradlew" || true
-            chmod +x "$ROOT_DIR/gradlew" || true
-          fi
-
-          # --- FIX 1: Missing ShapeAppearanceOverlay.App (your current crash)
-          VALUES_DIR="$ROOT_DIR/app/src/main/res/values"
-          mkdir -p "$VALUES_DIR"
-
-          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay"' "$VALUES_DIR" >/dev/null 2>&1; then
-            printf '%s\n' \
-              '<resources>' \
-              '  <style name="ShapeAppearanceOverlay">' \
-              '    <item name="cornerFamily">rounded</item>' \
-              '    <item name="cornerSize">16dp</item>' \
-              '  </style>' \
-              '</resources>' \
-              > "$VALUES_DIR/zz_hyper_hotfix_shape_base.xml"
-          fi
-
-          # IMPORTANT: exact match with closing quote (so it won't mistake Round16 as App)
-          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay.App"' "$VALUES_DIR" >/dev/null 2>&1; then
-            printf '%s\n' \
-              '<resources>' \
-              '  <style name="ShapeAppearanceOverlay.App">' \
-              '    <item name="cornerFamily">rounded</item>' \
-              '    <item name="cornerSize">16dp</item>' \
-              '  </style>' \
-              '</resources>' \
-              > "$VALUES_DIR/zz_hyper_hotfix_shape_app.xml"
-          fi
-
-          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay.App.Round16"' "$VALUES_DIR" >/dev/null 2>&1; then
-            printf '%s\n' \
-              '<resources>' \
-              '  <style name="ShapeAppearanceOverlay.App.Round16">' \
-              '    <item name="cornerFamily">rounded</item>' \
-              '    <item name="cornerSize">16dp</item>' \
-              '  </style>' \
-              '</resources>' \
-              > "$VALUES_DIR/zz_hyper_hotfix_shape_round16.xml"
-          fi
-
-          # --- FIX 2: BuildConfig generation (avoids later Kotlin errors)
-          APP_GRADLE="$ROOT_DIR/app/build.gradle.kts"
-          if [ -f "$APP_GRADLE" ]; then
-            if grep -q "buildFeatures" "$APP_GRADLE" && ! grep -q "buildConfig" "$APP_GRADLE"; then
-              sed -i '/buildFeatures {/,/}/ s/viewBinding = true/viewBinding = true\n    buildConfig = true/' "$APP_GRADLE" || true
-            fi
-          fi
-
-          # --- FIX 3: Media3 transformer API mismatches (so next errors won't appear)
-          WORKER_FILE="$(find "$ROOT_DIR/app/src/main/java" -maxdepth 14 -name "CompressWorker.kt" -print -quit || true)"
-          if [ -n "$WORKER_FILE" ] && [ -f "$WORKER_FILE" ]; then
-            sed -i '/import androidx\.media3\.transformer\.AudioEncoderSettings/d' "$WORKER_FILE" || true
-            sed -i '/val aSettings = AudioEncoderSettings\.Builder()/,/\.build()/d' "$WORKER_FILE" || true
-            sed -i '/setRequestedAudioEncoderSettings/d' "$WORKER_FILE" || true
-            sed -i '/setIFrameIntervalSeconds/d' "$WORKER_FILE" || true
-            sed -i 's/FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING/FOREGROUND_SERVICE_TYPE_DATA_SYNC/g' "$WORKER_FILE" || true
-          fi
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build Debug APK
         shell: bash
         run: |
           set -euo pipefail
-          cd "$ROOT_DIR"
-          if [ ! -f "./gradlew" ]; then
-            gradle wrapper --gradle-version 8.6
-            chmod +x ./gradlew
-          fi
+          cd "${ROOT_DIR}"
+          chmod +x ./gradlew || true
           ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
-          path: project/**/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          path: |
+            **/app/build/outputs/apk/debug/*.apk 
