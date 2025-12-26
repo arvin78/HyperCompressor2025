@@ -1,4 +1,4 @@
-name: Build APK from ZIP (Auto Patch)
+name: Build APK from ZIP (Auto-Fix Resources + Media3)
 
 on:
   workflow_dispatch:
@@ -63,40 +63,71 @@ jobs:
       - name: Install SDK packages
         run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Patch project (fix BuildConfig + Media3 API + FGS type)
+      - name: Patch project (fix missing styles + BuildConfig + Media3 API)
         shell: bash
         run: |
           set -euo pipefail
 
-          # --- Make gradlew executable and fix CRLF
+          # gradlew perms + CRLF
           if [ -f "$ROOT_DIR/gradlew" ]; then
             sed -i 's/\r$//' "$ROOT_DIR/gradlew" || true
             chmod +x "$ROOT_DIR/gradlew" || true
           fi
 
-          # --- Ensure BuildConfig exists (fix: Unresolved reference BuildConfig)
+          # --- FIX 1: Missing ShapeAppearanceOverlay.App (your current crash)
+          VALUES_DIR="$ROOT_DIR/app/src/main/res/values"
+          mkdir -p "$VALUES_DIR"
+
+          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay"' "$VALUES_DIR" >/dev/null 2>&1; then
+            printf '%s\n' \
+              '<resources>' \
+              '  <style name="ShapeAppearanceOverlay">' \
+              '    <item name="cornerFamily">rounded</item>' \
+              '    <item name="cornerSize">16dp</item>' \
+              '  </style>' \
+              '</resources>' \
+              > "$VALUES_DIR/zz_hyper_hotfix_shape_base.xml"
+          fi
+
+          # IMPORTANT: exact match with closing quote (so it won't mistake Round16 as App)
+          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay.App"' "$VALUES_DIR" >/dev/null 2>&1; then
+            printf '%s\n' \
+              '<resources>' \
+              '  <style name="ShapeAppearanceOverlay.App">' \
+              '    <item name="cornerFamily">rounded</item>' \
+              '    <item name="cornerSize">16dp</item>' \
+              '  </style>' \
+              '</resources>' \
+              > "$VALUES_DIR/zz_hyper_hotfix_shape_app.xml"
+          fi
+
+          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay.App.Round16"' "$VALUES_DIR" >/dev/null 2>&1; then
+            printf '%s\n' \
+              '<resources>' \
+              '  <style name="ShapeAppearanceOverlay.App.Round16">' \
+              '    <item name="cornerFamily">rounded</item>' \
+              '    <item name="cornerSize">16dp</item>' \
+              '  </style>' \
+              '</resources>' \
+              > "$VALUES_DIR/zz_hyper_hotfix_shape_round16.xml"
+          fi
+
+          # --- FIX 2: BuildConfig generation (avoids later Kotlin errors)
           APP_GRADLE="$ROOT_DIR/app/build.gradle.kts"
           if [ -f "$APP_GRADLE" ]; then
-            if ! grep -q "buildConfig" "$APP_GRADLE"; then
-              # insert after viewBinding line (present in your project)
-              sed -i '/viewBinding = true/a\    buildConfig = true' "$APP_GRADLE"
+            if grep -q "buildFeatures" "$APP_GRADLE" && ! grep -q "buildConfig" "$APP_GRADLE"; then
+              sed -i '/buildFeatures {/,/}/ s/viewBinding = true/viewBinding = true\n    buildConfig = true/' "$APP_GRADLE" || true
             fi
           fi
 
-          # --- Fix Worker code to match current media3-transformer (remove unavailable APIs)
-          WORKER_FILE="$(find "$ROOT_DIR/app/src/main/java" -maxdepth 12 -name "CompressWorker.kt" -print -quit || true)"
+          # --- FIX 3: Media3 transformer API mismatches (so next errors won't appear)
+          WORKER_FILE="$(find "$ROOT_DIR/app/src/main/java" -maxdepth 14 -name "CompressWorker.kt" -print -quit || true)"
           if [ -n "$WORKER_FILE" ] && [ -f "$WORKER_FILE" ]; then
-            sed -i '/import androidx\.media3\.transformer\.AudioEncoderSettings/d' "$WORKER_FILE"
+            sed -i '/import androidx\.media3\.transformer\.AudioEncoderSettings/d' "$WORKER_FILE" || true
             sed -i '/val aSettings = AudioEncoderSettings\.Builder()/,/\.build()/d' "$WORKER_FILE" || true
-            sed -i '/setRequestedAudioEncoderSettings/d' "$WORKER_FILE"
-            sed -i '/setIFrameIntervalSeconds/d' "$WORKER_FILE"
-            sed -i 's/FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING/FOREGROUND_SERVICE_TYPE_DATA_SYNC/g' "$WORKER_FILE"
-          fi
-
-          # --- Fix manifest permission to match foreground service type on Android 14+
-          MANIFEST="$ROOT_DIR/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            sed -i 's/android\.permission\.FOREGROUND_SERVICE_MEDIA_PROCESSING/android.permission.FOREGROUND_SERVICE_DATA_SYNC/g' "$MANIFEST"
+            sed -i '/setRequestedAudioEncoderSettings/d' "$WORKER_FILE" || true
+            sed -i '/setIFrameIntervalSeconds/d' "$WORKER_FILE" || true
+            sed -i 's/FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING/FOREGROUND_SERVICE_TYPE_DATA_SYNC/g' "$WORKER_FILE" || true
           fi
 
       - name: Build Debug APK
