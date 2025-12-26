@@ -1,4 +1,4 @@
-name: Build APK from ZIP
+name: Build APK from ZIP (Smart Auto-Fix)
 
 on:
   workflow_dispatch:
@@ -14,54 +14,108 @@ jobs:
       - name: Install unzip
         run: sudo apt-get update && sudo apt-get install -y unzip
 
-      - name: Unzip project (any zip name)
+      - name: Detect ZIP (smart) and unzip
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           echo "Repo root files:"
           ls -la
-          ZIPFILE="$(ls -t *.zip | head -n 1)"
+
+          ZIPFILE=""
+          # Prefer known names (edit/add here if you want)
+          for cand in \
+            "HyperCompressor_2025_PRO.zip" \
+            "HyperCompressor_2025.zip" \
+            "HyperCompressor_2025 (1).zip"
+          do
+            if [ -f "$cand" ]; then ZIPFILE="$cand"; break; fi
+          done
+
+          # Fallback: any zip in repo root (first match)
           if [ -z "$ZIPFILE" ]; then
-            echo "No ZIP found in repo root!"
+            ZIPFILE="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit | sed 's|^\./||')"
+          fi
+
+          if [ -z "$ZIPFILE" ]; then
+            echo "ERROR: No ZIP found in repo root."
             exit 1
           fi
+
           echo "Using ZIP: $ZIPFILE"
           mkdir -p project
           unzip -o "$ZIPFILE" -d project
 
-      - name: Find project root
+          echo "Top-level after unzip:"
+          ls -la project || true
+
+      - name: Find project root (settings.gradle)
         shell: bash
         run: |
-          set -e
-          ROOT_FILE="$(find project -maxdepth 6 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
+          set -euo pipefail
+          ROOT_FILE="$(find project -maxdepth 8 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
           if [ -z "$ROOT_FILE" ]; then
-            echo "Could not find settings.gradle(.kts) inside zip"
+            echo "ERROR: settings.gradle(.kts) not found inside zip."
+            find project -maxdepth 4 -type f | head -n 200 || true
             exit 1
           fi
           ROOT_DIR="$(dirname "$ROOT_FILE")"
           echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_ENV
           echo "Detected project root: $ROOT_DIR"
 
-      # ✅ HOTFIX: رفع خطای ShapeAppearanceOverlay.App (بدون تغییر ZIP)
-      - name: Hotfix missing ShapeAppearanceOverlay.App style
+      - name: SMART AUTO-FIX (resources + common build breakers)
         shell: bash
         run: |
-          set -e
-          VALUES_DIR="${{ env.ROOT_DIR }}/app/src/main/res/values"
+          set -euo pipefail
+          ROOT_DIR="${{ env.ROOT_DIR }}"
+          VALUES_DIR="$ROOT_DIR/app/src/main/res/values"
           mkdir -p "$VALUES_DIR"
-          cat > "$VALUES_DIR/hyper_styles.xml" <<'XML'
-          <resources>
-            <style name="ShapeAppearanceOverlay.App">
-              <item name="cornerFamily">rounded</item>
-              <item name="cornerSize">16dp</item>
-            </style>
-            <style name="ShapeAppearanceOverlay.App.Round16">
-              <item name="cornerFamily">rounded</item>
-              <item name="cornerSize">16dp</item>
-            </style>
-          </resources>
-          XML
-          echo "Wrote $VALUES_DIR/hyper_styles.xml"
+
+          # ---- Fix 1) Missing ShapeAppearanceOverlay styles (ONLY if missing; avoid duplicates)
+          NEED_APP=0
+          NEED_R16=0
+
+          if ! grep -R --include='*.xml' -n 'name="ShapeAppearanceOverlay\.App"' "$VALUES_DIR" >/dev/null 2>&1; then
+            NEED_APP=1
+          fi
+          if ! grep -R --include='*.xml' -n 'name="ShapeAppearanceOverlay\.App\.Round16"' "$VALUES_DIR" >/dev/null 2>&1; then
+            NEED_R16=1
+          fi
+
+          if [ "$NEED_APP" -eq 1 ] || [ "$NEED_R16" -eq 1 ]; then
+            HOTFIX_FILE="$VALUES_DIR/hyper_hotfix.xml"
+            echo "Creating $HOTFIX_FILE (only missing styles)"
+            {
+              echo '<resources>'
+              if [ "$NEED_APP" -eq 1 ]; then
+                cat <<'XML'
+  <style name="ShapeAppearanceOverlay.App">
+    <item name="cornerFamily">rounded</item>
+    <item name="cornerSize">16dp</item>
+  </style>
+XML
+              fi
+              if [ "$NEED_R16" -eq 1 ]; then
+                cat <<'XML'
+  <style name="ShapeAppearanceOverlay.App.Round16">
+    <item name="cornerFamily">rounded</item>
+    <item name="cornerSize">16dp</item>
+  </style>
+XML
+              fi
+              echo '</resources>'
+            } > "$HOTFIX_FILE"
+          else
+            echo "Styles already exist. No resource hotfix needed."
+          fi
+
+          # ---- Fix 2) Make gradlew executable if present
+          if [ -f "$ROOT_DIR/gradlew" ]; then
+            chmod +x "$ROOT_DIR/gradlew" || true
+          fi
+
+          # ---- Fix 3) Normalize line endings in gradle scripts (rare but can break on linux)
+          find "$ROOT_DIR" -maxdepth 3 -type f \( -name "*.gradle" -o -name "*.gradle.kts" -o -name "gradlew" \) -print0 \
+            | xargs -0 -I{} bash -lc 'sed -i "s/\r$//" "{}" || true'
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -81,18 +135,23 @@ jobs:
         with:
           gradle-version: "8.6"
 
-      - name: Build Debug APK
+      - name: Build Debug APK (max info)
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           cd "${{ env.ROOT_DIR }}"
-          gradle wrapper --gradle-version 8.6
-          chmod +x ./gradlew
-          ./gradlew :app:assembleDebug
+
+          # Prefer wrapper if exists; else generate one
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 8.6
+            chmod +x ./gradlew
+          fi
+
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: |
-            ${{ env.ROOT_DIR }}/app/build/outputs/apk/debug/*.apk
+            ${{ env.ROOT_DIR }}/app/build/outputs/apk/debug/*.apk 
