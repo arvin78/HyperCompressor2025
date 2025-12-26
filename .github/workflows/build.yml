@@ -1,84 +1,92 @@
-name: Build APK from ZIP
+name: Build Android APK (from ZIP)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [ "main", "master" ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate ZIP and unzip
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Unzip project
         shell: bash
         run: |
           set -e
-          ZIPFILE=$(ls -1S *.zip 2>/dev/null | head -n 1 || true)
+          # Prefer a single ZIP in repo root. If multiple exist, prefer STABLE.
+          ZIPFILE="$(ls -1 *STABLE*.zip 2>/dev/null | head -n 1 || true)"
           if [ -z "$ZIPFILE" ]; then
-            echo "ERROR: No .zip found in repo root."
+            ZIPFILE="$(ls -1 *.zip 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -z "$ZIPFILE" ]; then
+            echo "ERROR: No .zip file found in repository root."
             ls -la
             exit 1
           fi
+
           echo "Using ZIP: $ZIPFILE"
           rm -rf project
           mkdir -p project
-          unzip -q "$ZIPFILE" -d project
+          unzip -q -o "$ZIPFILE" -d project
 
-          SETTINGS=$(find project -maxdepth 8 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) -print -quit)
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: settings.gradle(.kts) not found inside zip."
-            find project -maxdepth 4 -type f | head -n 200 || true
+          ROOT_FILE="$(find project -maxdepth 6 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
+          if [ -z "$ROOT_FILE" ]; then
+            echo "ERROR: settings.gradle(.kts) not found after unzip."
+            find project -maxdepth 4 -type f | head -n 200
             exit 1
           fi
-          ROOT_DIR=$(dirname "$SETTINGS")
-          echo "ROOT_DIR=$ROOT_DIR" >> "$GITHUB_ENV"
-          echo "Project root: $ROOT_DIR"
 
-      - name: Set up JDK 17
+          ROOT_DIR="$(dirname "$ROOT_FILE")"
+          echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_ENV
+          echo "Project root: $ROOT_DIR"
+          ls -la "$ROOT_DIR"
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install SDK packages + accept licenses (no broken-pipe fail)
+      - name: Accept Android licenses (no pipefail)
         shell: bash
         run: |
           set -e
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          yes | sdkmanager --licenses > /dev/null || true
 
-          # Accept licenses but do NOT fail on "yes: Broken pipe".
-          set +e
-          yes | sdkmanager --licenses > /dev/null 2>&1
-          SDK_STATUS=${PIPESTATUS[1]}
+      - name: Install required SDK packages
+        shell: bash
+        run: |
           set -e
+          sdkmanager --install "platform-tools" > /dev/null
+          sdkmanager --install "platforms;android-34" > /dev/null
+          sdkmanager --install "build-tools;34.0.0" > /dev/null
 
-          if [ "$SDK_STATUS" -ne 0 ]; then
-            echo "sdkmanager --licenses failed with exit code $SDK_STATUS"
-            exit "$SDK_STATUS"
-          fi
-
-      - name: Set up Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.7"
+          gradle-version: "8.6"
 
       - name: Build Debug APK
         shell: bash
-        working-directory: ${{ env.ROOT_DIR }}
         run: |
           set -e
-          gradle :app:assembleDebug --no-daemon
+          cd "$ROOT_DIR"
+          gradle --no-daemon --stacktrace :app:assembleDebug
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
-          path: ${{ env.ROOT_DIR }}/app/build/outputs/apk/debug/*.apk 
+          path: |
+            project/**/app/build/outputs/apk/debug/*.apk
