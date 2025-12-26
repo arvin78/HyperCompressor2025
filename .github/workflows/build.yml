@@ -1,152 +1,70 @@
-name: Build Debug APK (from ZIP) - Stable
+name: Build APK (ZIP)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [ "main", "master" ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Unzip + Detect Root + Patch + Ensure Wrapper
-        shell: bash
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Find ZIP and unzip
         run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y unzip curl
-
-          # 1) Pick ZIP (prefer PRO)
-          ZIPFILE="HyperCompressor_2025_PRO.zip"
-          if [ ! -f "$ZIPFILE" ]; then
-            ZIPFILE="$(ls -t *.zip 2>/dev/null | head -n 1 || true)"
-          fi
-
-          if [ -z "${ZIPFILE}" ] || [ ! -f "${ZIPFILE}" ]; then
-            echo "ERROR: No ZIP found in repo root."
-            ls -la
-            exit 1
-          fi
-
-          echo "Using ZIP: ${ZIPFILE}"
+          ZIPFILE=$(ls -1S *.zip | head -n 1)
+          echo "Using zip: $ZIPFILE"
           rm -rf project
           mkdir -p project
-          unzip -o "${ZIPFILE}" -d project
+          unzip -q "$ZIPFILE" -d project
 
-          # 2) Find Gradle project root (settings.gradle/.kts)
-          ROOT_FILE="$(find project -maxdepth 12 -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit || true)"
-          if [ -z "${ROOT_FILE}" ]; then
-            echo "ERROR: settings.gradle(.kts) not found inside zip."
-            find project -maxdepth 6 -type f | head -n 300 || true
+          ROOT_DIR=$(python3 - <<'PY'
+import os
+root_dir = ""
+for root, dirs, files in os.walk("project"):
+    if "settings.gradle" in files or "settings.gradle.kts" in files:
+        root_dir = root
+        break
+print(root_dir)
+PY
+)
+          if [ -z "$ROOT_DIR" ]; then
+            echo "ERROR: Could not find settings.gradle(.kts) after unzip."
             exit 1
           fi
+          echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_ENV
+          echo "Gradle root: $ROOT_DIR"
 
-          ROOT_DIR="$(dirname "${ROOT_FILE}")"
-          echo "ROOT_DIR=${ROOT_DIR}" >> "${GITHUB_ENV}"
-          echo "Project root: ${ROOT_DIR}"
-          ls -la "${ROOT_DIR}" || true
-
-          # 3) Patch Resources (fix: ShapeAppearanceOverlay.App not found)
-          VALUES_DIR="${ROOT_DIR}/app/src/main/res/values"
-          mkdir -p "${VALUES_DIR}"
-
-          # Base + App + Round16 (safe, no conflict)
-          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay"' "${VALUES_DIR}" >/dev/null 2>&1; then
-            printf '%s\n' \
-              '<resources>' \
-              '  <style name="ShapeAppearanceOverlay">' \
-              '    <item name="cornerFamily">rounded</item>' \
-              '    <item name="cornerSize">16dp</item>' \
-              '  </style>' \
-              '</resources>' \
-              > "${VALUES_DIR}/zz_hotfix_shape_base.xml"
-          fi
-
-          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay.App"' "${VALUES_DIR}" >/dev/null 2>&1; then
-            printf '%s\n' \
-              '<resources>' \
-              '  <style name="ShapeAppearanceOverlay.App">' \
-              '    <item name="cornerFamily">rounded</item>' \
-              '    <item name="cornerSize">16dp</item>' \
-              '  </style>' \
-              '</resources>' \
-              > "${VALUES_DIR}/zz_hotfix_shape_app.xml"
-          fi
-
-          if ! grep -R -F --include='*.xml' 'name="ShapeAppearanceOverlay.App.Round16"' "${VALUES_DIR}" >/dev/null 2>&1; then
-            printf '%s\n' \
-              '<resources>' \
-              '  <style name="ShapeAppearanceOverlay.App.Round16">' \
-              '    <item name="cornerFamily">rounded</item>' \
-              '    <item name="cornerSize">16dp</item>' \
-              '  </style>' \
-              '</resources>' \
-              > "${VALUES_DIR}/zz_hotfix_shape_round16.xml"
-          fi
-
-          # 4) Patch Worker runtime crash (FGS type) + Media3 API mismatches
-          WORKER="$(find "${ROOT_DIR}/app/src/main/java" -type f -name 'CompressWorker.kt' -print -quit || true)"
-          if [ -n "${WORKER}" ] && [ -f "${WORKER}" ]; then
-            sed -i 's/FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING/FOREGROUND_SERVICE_TYPE_DATA_SYNC/g' "${WORKER}" || true
-            sed -i '/import androidx\.media3\.transformer\.AudioEncoderSettings/d' "${WORKER}" || true
-            sed -i '/val aSettings = AudioEncoderSettings\.Builder()/,/\.build()/d' "${WORKER}" || true
-            sed -i '/setRequestedAudioEncoderSettings/d' "${WORKER}" || true
-            sed -i '/setIFrameIntervalSeconds/d' "${WORKER}" || true
-          fi
-
-          # 5) Ensure BuildConfig generation (avoids "Unresolved reference: BuildConfig")
-          APP_GRADLE="${ROOT_DIR}/app/build.gradle.kts"
-          if [ -f "${APP_GRADLE}" ]; then
-            if grep -q "buildFeatures" "${APP_GRADLE}" && ! grep -q "buildConfig" "${APP_GRADLE}"; then
-              sed -i '/buildFeatures {/,/}/ s/viewBinding = true/viewBinding = true\n    buildConfig = true/' "${APP_GRADLE}" || true
-            fi
-          fi
-
-          # 6) Ensure gradlew exists (this fixes YOUR CURRENT ERROR)
-          if [ -f "${ROOT_DIR}/gradlew" ]; then
-            sed -i 's/\r$//' "${ROOT_DIR}/gradlew" || true
-            chmod +x "${ROOT_DIR}/gradlew" || true
-            echo "gradlew already exists."
-          else
-            echo "gradlew NOT found. Creating wrapper via downloaded Gradle 8.6..."
-            GRADLE_ZIP="/tmp/gradle-8.6-bin.zip"
-            curl -L -o "${GRADLE_ZIP}" "https://services.gradle.org/distributions/gradle-8.6-bin.zip"
-            unzip -q "${GRADLE_ZIP}" -d /tmp
-            /tmp/gradle-8.6/bin/gradle -v
-            (cd "${ROOT_DIR}" && /tmp/gradle-8.6/bin/gradle wrapper --gradle-version 8.6)
-            chmod +x "${ROOT_DIR}/gradlew" || true
-            echo "Wrapper created."
-          fi
-
-      - name: Setup Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Install SDK packages
-        run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          yes | sdkmanager --licenses >/dev/null
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
       - name: Build Debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${ROOT_DIR}"
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+        working-directory: ${{ env.ROOT_DIR }}
+        run: gradle :app:assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
-          path: project/**/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          path: ${{ env.ROOT_DIR }}/app/build/outputs/apk/debug/*.apk 
